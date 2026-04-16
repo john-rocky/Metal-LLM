@@ -31,7 +31,7 @@ final class EngineTests: XCTestCase {
 
     func testPromptLookupDrafter() async throws {
         let drafter = PromptLookupDrafter(ngramSize: 2)
-        drafter.updateHistory([1, 2, 3, 4, 5, 1, 2])
+        await drafter.updateHistory([1, 2, 3, 4, 5, 1, 2])
 
         let proposals = try await drafter.draft(lastToken: 2, maxTokens: 3)
         XCTAssertEqual(proposals, [3, 4, 5])
@@ -39,7 +39,7 @@ final class EngineTests: XCTestCase {
 
     func testPromptLookupNoMatch() async throws {
         let drafter = PromptLookupDrafter(ngramSize: 2)
-        drafter.updateHistory([1, 2, 3])
+        await drafter.updateHistory([1, 2, 3])
 
         let proposals = try await drafter.draft(lastToken: 3, maxTokens: 3)
         XCTAssertTrue(proposals.isEmpty)

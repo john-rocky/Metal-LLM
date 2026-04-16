@@ -43,6 +43,11 @@ let package = Package(
             dependencies: ["MetalLLMCore"],
             path: "Sources/MetalLLMUI"
         ),
+        .executableTarget(
+            name: "MetalLLMBench",
+            dependencies: ["MetalLLMCore"],
+            path: "Sources/MetalLLMBench"
+        ),
         .testTarget(
             name: "MetalLLMCoreTests",
             dependencies: ["MetalLLMCore"],

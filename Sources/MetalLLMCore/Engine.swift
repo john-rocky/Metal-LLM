@@ -121,6 +121,9 @@ public actor MetalLLMEngine {
             throw EngineError.notLoaded
         }
 
+        // Clear KV cache from any previous generation
+        await ctx.kvClear()
+
         // Configure sampler
         await ctx.configureSampler(config: config)
 
@@ -173,6 +176,11 @@ public actor MetalLLMEngine {
                 let text = await ctx.detokenize(tokenId)
                 let snap = metrics.snapshot()
                 let isFinal = await ctx.isEOG(tokenId)
+
+                if totalGenerated <= 3 || isFinal {
+                    print("[decode] token=\(tokenId) text='\(text)' eog=\(isFinal) total=\(totalGenerated)")
+                }
+
                 continuation.yield(TokenEvent(
                     token: text,
                     tokenId: tokenId,

@@ -59,7 +59,7 @@ public actor LlamaContext {
         self.vocab = llama_model_get_vocab(model)
         self.nVocab = llama_vocab_n_tokens(self.vocab)
         self.nCtx = llama_n_ctx(context)
-        self.batch = llama_batch_init(512, 0, 1)
+        self.batch = llama_batch_init(2048, 0, 1)
 
         // Default sampler chain
         let sparams = llama_sampler_chain_default_params()
@@ -99,7 +99,8 @@ public actor LlamaContext {
         ctxParams.n_batch = 512
         ctxParams.n_threads = Int32(nThreads)
         ctxParams.n_threads_batch = Int32(nThreads)
-        ctxParams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED
+        // FlashAttention disabled for now - enable after verifying stability
+        // ctxParams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED
 
         guard let context = llama_init_from_model(model, ctxParams) else {
             llama_model_free(model)
@@ -167,23 +168,41 @@ public actor LlamaContext {
     // MARK: - Prefill
 
     public func prefill(tokens: [llama_token]) throws {
-        llama_batch_clear(&batch)
-        for (i, token) in tokens.enumerated() {
-            let isLast = i == tokens.count - 1
-            llama_batch_add(&batch, token, Int32(i), [0], isLast)
+        let batchSize = Int(llama_n_batch(context))
+        let ubatchSize = Int(llama_n_ubatch(context))
+        let msg = "[prefill] n_tokens=\(tokens.count) n_batch=\(batchSize) n_ubatch=\(ubatchSize) n_ctx=\(nCtx)"
+        print(msg)
+        fputs(msg + "\n", stderr)
+
+        // Process in chunks of n_batch
+        var pos: Int32 = 0
+        var remaining = tokens
+        while !remaining.isEmpty {
+            let chunk = Array(remaining.prefix(batchSize))
+            remaining = Array(remaining.dropFirst(batchSize))
+
+            llama_batch_clear(&batch)
+            for (i, token) in chunk.enumerated() {
+                let isLast = remaining.isEmpty && i == chunk.count - 1
+                llama_batch_add(&batch, token, pos + Int32(i), [0], isLast)
+            }
+
+            let rc = llama_decode(context, batch)
+            guard rc == 0 else {
+                print("[LlamaContext] llama_decode failed during prefill, rc=\(rc), pos=\(pos), chunk_size=\(chunk.count)")
+                throw LlamaContextError.decodeFailed("prefill rc=\(rc) at pos=\(pos)")
+            }
+            pos += Int32(chunk.count)
         }
 
-        guard llama_decode(context, batch) == 0 else {
-            throw LlamaContextError.decodeFailed("prefill")
-        }
-        nCur = Int32(tokens.count)
+        nCur = pos
         nDecode = 0
     }
 
     // MARK: - Single-token decode
 
     public func sampleAndDecode() throws -> llama_token {
-        let newToken = llama_sampler_sample(sampling, context, batch.n_tokens - 1)
+        let newToken = llama_sampler_sample(sampling, context, -1)
 
         llama_batch_clear(&batch)
         llama_batch_add(&batch, newToken, nCur, [0], true)
