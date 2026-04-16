@@ -1,0 +1,44 @@
+# Xcode
+*.xcuserstate
+*.xcworkspace
+xcuserdata/
+DerivedData/
+build/
+.build/
+*.xcodeproj/project.xcworkspace/
+*.xcodeproj/xcuserdata/
+
+# Swift Package Manager
+.swiftpm/
+Package.resolved
+.build/
+Packages/
+*.xcodeproj
+
+# macOS
+.DS_Store
+*.swp
+*.swo
+
+# IDE
+.idea/
+.vscode/
+
+# Models (GGUF, CoreML, etc.)
+*.gguf
+*.mlpackage
+*.mlmodelc
+*.mlmodel
+*.safetensors
+*.bin
+
+# Benchmarks raw output
+Benchmarks/**/*.json
+Benchmarks/**/*.csv
+Benchmarks/**/*.log
+!Benchmarks/Baseline/.gitkeep
+
+# Output
+output/
+tmp/
+*.log
