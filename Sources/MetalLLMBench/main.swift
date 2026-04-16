@@ -28,6 +28,10 @@ struct BenchMain {
         print("--- 1: Custom Metal Kernel Test ---")
         try benchCustomKernels()
 
+        // Test 1b: GGUF loading + 1 layer forward
+        print("\n--- 1b: GGUF Load + Layer Forward ---")
+        try benchLayerForward(modelPath: modelPath)
+
         // Test 2: llama.cpp baseline
         print("\n--- 2: llama.cpp Greedy Decode ---")
         let llamaTps = try benchLlamaCpp(modelPath: modelPath, maxTokens: maxTokens)
@@ -241,6 +245,70 @@ struct BenchMain {
         let tps = Double(count) / (CFAbsoluteTimeGetCurrent() - t0)
         print("  \(count) tokens, \(String(format: "%.1f", tps)) tok/s")
         return tps
+    }
+
+    // MARK: - Layer forward bench
+
+    static func benchLayerForward(modelPath: String) throws {
+        let runtime = try MetalRuntime()
+        let loader = GGUFLoader(device: runtime.device)
+
+        // Load only layer 0 weights
+        let layer0Names = [
+            "blk.0.attn_norm.weight",
+            "blk.0.attn_q.weight", "blk.0.attn_k.weight", "blk.0.attn_v.weight",
+            "blk.0.attn_output.weight",
+            "blk.0.ffn_norm.weight",
+            "blk.0.ffn_gate.weight", "blk.0.ffn_up.weight", "blk.0.ffn_down.weight",
+        ]
+
+        let loadStart = CFAbsoluteTimeGetCurrent()
+        try loader.load(path: modelPath, tensorNames: layer0Names)
+        let loadTime = CFAbsoluteTimeGetCurrent() - loadStart
+        print("  GGUF load: \(String(format: "%.2f", loadTime))s, \(loader.tensors.count) tensors")
+
+        // Print loaded tensor info
+        for (name, t) in loader.tensors.sorted(by: { $0.key < $1.key }) {
+            print("    \(name): \(t.size) bytes, type=\(t.type.rawValue)")
+        }
+
+        // Create layer
+        let config = Gemma4Config.gemma4E2B
+        let layer = Gemma4Layer(runtime: runtime, layerIdx: 0, config: config)
+        layer.loadWeights(from: loader)
+
+        // Create dummy input (1536 fp16)
+        var inputData = [Float16](repeating: Float16(0.01), count: config.nEmbd)
+        for i in 0..<config.nEmbd { inputData[i] = Float16.random(in: -0.1...0.1) }
+        guard let inputBuf = runtime.makeBuffer(data: inputData) else {
+            print("  Failed to create input buffer")
+            return
+        }
+
+        // Warmup
+        for _ in 0..<3 {
+            runtime.execute { enc in
+                layer.forward(encoder: enc, input: inputBuf, kvCache: nil, position: 0)
+            }
+        }
+
+        // Benchmark: 100 iterations of 1-layer forward
+        let iterations = 100
+        let t0 = DispatchTime.now().uptimeNanoseconds
+
+        for _ in 0..<iterations {
+            runtime.execute { enc in
+                layer.forward(encoder: enc, input: inputBuf, kvCache: nil, position: 0)
+            }
+        }
+
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9
+        let perLayer = elapsed / Double(iterations) * 1e3  // ms
+
+        print("  1-layer forward: \(String(format: "%.3f", perLayer)) ms/layer")
+        print("  35-layer estimate: \(String(format: "%.1f", perLayer * 35)) ms/token")
+        print("  Estimated tok/s: \(String(format: "%.0f", 1000 / (perLayer * 35)))")
+        print("  (Note: attention/RoPE/O-proj not yet implemented — FFN path only)")
     }
 
     static func tokenize(vocab: OpaquePointer, text: String) -> [llama_token] {
