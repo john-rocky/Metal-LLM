@@ -20,16 +20,16 @@ public final class Gemma4Layer {
     private let isSWA: Bool
     private let eps: Float = 1e-6
 
-    // Weights
+    // Weights (buffer + type for kernel selection)
     private var attnNormW: MTLBuffer?
-    private var qWeight: MTLBuffer?
-    private var kWeight: MTLBuffer?
-    private var vWeight: MTLBuffer?
-    private var oWeight: MTLBuffer?
+    private var qWeight: MTLBuffer?;  private var qType: Int32 = 0
+    private var kWeight: MTLBuffer?;  private var kType: Int32 = 0
+    private var vWeight: MTLBuffer?;  private var vType: Int32 = 0
+    private var oWeight: MTLBuffer?;  private var oType: Int32 = 0
     private var ffnNormW: MTLBuffer?
-    private var gateWeight: MTLBuffer?
-    private var upWeight: MTLBuffer?
-    private var downWeight: MTLBuffer?
+    private var gateWeight: MTLBuffer?; private var gateType: Int32 = 0
+    private var upWeight: MTLBuffer?;   private var upType: Int32 = 0
+    private var downWeight: MTLBuffer?; private var downType: Int32 = 0
 
     // Scratch
     private var normedBuf: MTLBuffer?
@@ -71,16 +71,22 @@ public final class Gemma4Layer {
 
     public func loadWeights(from loader: GGUFLoader) {
         let l = layerIdx
+        func load(_ comp: String) -> (MTLBuffer?, Int32) {
+            if let t = loader.layerTensor(layer: l, component: comp) {
+                return (t.buffer, Int32(t.type.rawValue))
+            }
+            return (nil, 0)
+        }
         attnNormW = loader.layerTensor(layer: l, component: "attn_norm")?.buffer
-        qWeight = loader.layerTensor(layer: l, component: "attn_q")?.buffer
-        kWeight = loader.layerTensor(layer: l, component: "attn_k")?.buffer
-        vWeight = loader.layerTensor(layer: l, component: "attn_v")?.buffer
-        oWeight = loader.layerTensor(layer: l, component: "attn_output")?.buffer
+        (qWeight, qType) = load("attn_q")
+        (kWeight, kType) = load("attn_k")
+        (vWeight, vType) = load("attn_v")
+        (oWeight, oType) = load("attn_output")
         ffnNormW = loader.layerTensor(layer: l, component: "ffn_norm")?.buffer
-        gateWeight = loader.layerTensor(layer: l, component: "ffn_gate")?.buffer
-        upWeight = loader.layerTensor(layer: l, component: "ffn_up")?.buffer
-        downWeight = loader.layerTensor(layer: l, component: "ffn_down")?.buffer
-        print("[Layer \(l)] \(isSWA ? "SWA" : "Full") hd=\(headDim) ff=\(nFF) hasKV=\(kWeight != nil)")
+        (gateWeight, gateType) = load("ffn_gate")
+        (upWeight, upType) = load("ffn_up")
+        (downWeight, downType) = load("ffn_down")
+        print("[Layer \(l)] \(isSWA ? "SWA" : "Full") hd=\(headDim) ff=\(nFF) qType=\(qType) downType=\(downType)")
     }
 
     // MARK: - Forward
@@ -92,31 +98,25 @@ public final class Gemma4Layer {
         position: Int
     ) {
         // --- Attention block ---
-        // Fused RMSNorm + Q projection
         dispatchFusedNormMatvec(encoder: encoder, input: input, normW: attnNormW,
                                 weight: qWeight, output: qBuf, normed: normedBuf,
-                                inDim: nEmbd, outDim: nHead * headDim)
+                                inDim: nEmbd, outDim: nHead * headDim, weightType: qType)
 
-        // K projection (from normed)
         dispatchMatvec(encoder: encoder, input: normedBuf, weight: kWeight,
-                       output: kBuf, inDim: nEmbd, outDim: nHeadKV * headDim)
+                       output: kBuf, inDim: nEmbd, outDim: nHeadKV * headDim, weightType: kType)
 
-        // V projection (from normed)
         dispatchMatvec(encoder: encoder, input: normedBuf, weight: vWeight,
-                       output: vBuf, inDim: nEmbd, outDim: nHeadKV * headDim)
+                       output: vBuf, inDim: nEmbd, outDim: nHeadKV * headDim, weightType: vType)
 
         // TODO: RoPE, SDPA, O projection, attention residual add
-        // For now, skip attention output and go straight to FFN
 
         // --- FFN block ---
-        // Fused RMSNorm + gate projection
         dispatchFusedNormMatvec(encoder: encoder, input: input, normW: ffnNormW,
                                 weight: gateWeight, output: gateBuf, normed: normedBuf,
-                                inDim: nEmbd, outDim: nFF)
+                                inDim: nEmbd, outDim: nFF, weightType: gateType)
 
-        // Up projection (from normed)
         dispatchMatvec(encoder: encoder, input: normedBuf, weight: upWeight,
-                       output: upBuf, inDim: nEmbd, outDim: nFF)
+                       output: upBuf, inDim: nEmbd, outDim: nFF, weightType: upType)
 
         // SwiGLU
         if let pipeline = runtime.pipeline("kernel_swiglu"),
@@ -135,7 +135,7 @@ public final class Gemma4Layer {
 
         // Down projection
         dispatchMatvec(encoder: encoder, input: swigluBuf, weight: downWeight,
-                       output: downBuf, inDim: nFF, outDim: nEmbd)
+                       output: downBuf, inDim: nFF, outDim: nEmbd, weightType: downType)
 
         // Residual add
         if let pipeline = runtime.pipeline("kernel_residual_add"), let down = downBuf {
@@ -153,13 +153,30 @@ public final class Gemma4Layer {
 
     // MARK: - Dispatch helpers
 
+    /// Select kernel name based on weight quantization type.
+    private func matvecKernel(type: Int32) -> String {
+        switch type {
+        case 12: return "kernel_matvec_q4_K"   // GGML_TYPE_Q4_K
+        case 14: return "kernel_matvec_q6_K"   // GGML_TYPE_Q6_K
+        default: return "kernel_matvec_q4_0"   // fallback
+        }
+    }
+
+    private func fusedNormMatvecKernel(type: Int32) -> String {
+        switch type {
+        case 12: return "kernel_fused_rmsnorm_matvec_q4_K"
+        default: return "kernel_fused_rmsnorm_matvec_q4_0"
+        }
+    }
+
     /// Dispatch SIMDgroup-cooperative matvec: N output rows, each by 1 simdgroup.
     private func dispatchMatvec(
         encoder: MTLComputeCommandEncoder,
         input: MTLBuffer?, weight: MTLBuffer?, output: MTLBuffer?,
-        inDim: Int, outDim: Int
+        inDim: Int, outDim: Int, weightType: Int32 = 0
     ) {
-        guard let pipeline = runtime.pipeline("kernel_matvec_q4_0"),
+        let kernelName = matvecKernel(type: weightType)
+        guard let pipeline = runtime.pipeline(kernelName),
               let inp = input, let w = weight, let out = output else { return }
 
         encoder.setComputePipelineState(pipeline)
@@ -183,9 +200,10 @@ public final class Gemma4Layer {
         encoder: MTLComputeCommandEncoder,
         input: MTLBuffer?, normW: MTLBuffer?, weight: MTLBuffer?,
         output: MTLBuffer?, normed: MTLBuffer?,
-        inDim: Int, outDim: Int
+        inDim: Int, outDim: Int, weightType: Int32 = 0
     ) {
-        guard let pipeline = runtime.pipeline("kernel_fused_rmsnorm_matvec_q4_0"),
+        let kernelName = fusedNormMatvecKernel(type: weightType)
+        guard let pipeline = runtime.pipeline(kernelName),
               let inp = input, let nw = normW, let w = weight,
               let out = output, let norm = normed else { return }
 

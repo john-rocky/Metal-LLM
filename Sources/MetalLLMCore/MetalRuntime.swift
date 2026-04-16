@@ -44,7 +44,10 @@ public final class MetalRuntime {
         // Pre-compile all pipeline states
         try compilePipeline("kernel_rms_norm")
         try compilePipeline("kernel_matvec_q4_0")
+        try compilePipeline("kernel_matvec_q4_K")
+        try compilePipeline("kernel_matvec_q6_K")
         try compilePipeline("kernel_fused_rmsnorm_matvec_q4_0")
+        try compilePipeline("kernel_fused_rmsnorm_matvec_q4_K")
         try compilePipeline("kernel_swiglu")
         try compilePipeline("kernel_residual_add")
 
