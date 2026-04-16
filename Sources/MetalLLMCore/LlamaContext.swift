@@ -12,11 +12,11 @@ import llama
 
 // MARK: - Batch helpers
 
-func llama_batch_clear(_ batch: inout llama_batch) {
+public func llama_batch_clear(_ batch: inout llama_batch) {
     batch.n_tokens = 0
 }
 
-func llama_batch_add(
+public func llama_batch_add(
     _ batch: inout llama_batch,
     _ id: llama_token,
     _ pos: llama_pos,
