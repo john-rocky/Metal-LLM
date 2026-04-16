@@ -30,6 +30,9 @@ let package = Package(
             name: "MetalLLMCore",
             dependencies: ["llama"],
             path: "Sources/MetalLLMCore",
+            resources: [
+                .process("Metal"),
+            ],
             linkerSettings: [
                 .linkedFramework("Accelerate"),
                 .linkedFramework("Metal"),

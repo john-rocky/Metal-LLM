@@ -57,7 +57,7 @@ final class EngineTests: XCTestCase {
     func testSpecDecodeOrchestratorInit() {
         let orch = SpecDecodeOrchestrator()
         XCTAssertEqual(orch.K, 3)
-        XCTAssertEqual(orch.fallbackThreshold, 0.15)
+        XCTAssertEqual(orch.fallbackThreshold, 0.20)
     }
 
     func testEngineInitialises() async {
