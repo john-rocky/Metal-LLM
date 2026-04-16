@@ -1,6 +1,6 @@
 //
 //  main.swift
-//  MetalLLMBench — comprehensive A/B/C benchmark
+//  MetalLLMBench — optimization sweep
 //
 
 import Foundation
@@ -20,43 +20,53 @@ struct BenchMain {
 
         let modelPath = args[1]
         let maxTokens = args.count > 2 ? Int(args[2]) ?? 128 : 128
-        // Prompt that generates repetitive code patterns (good for n-gram spec)
-        let prompt = "<start_of_turn>user\nWrite a Swift struct called User with properties: id (Int), name (String), email (String), age (Int), isActive (Bool). Then write Codable conformance, a static mock array of 10 users, and a function to filter active users.<end_of_turn>\n<start_of_turn>model\n"
+        let prompt = "<start_of_turn>user\nWhat is quantum computing?<end_of_turn>\n<start_of_turn>model\n"
 
-        print("=== Metal-LLM Bench ===")
-        print("Model: \(modelPath)")
+        print("=== Metal-LLM Optimization Sweep ===")
+        print("Model: \((modelPath as NSString).lastPathComponent)")
         print("Max tokens: \(maxTokens)\n")
 
-        // Use a single Engine instance for all tests (avoid GPU resource contention)
-        let engine = MetalLLMEngine()
-        try await engine.load(modelPath: URL(fileURLWithPath: modelPath))
+        // Sweep configurations
+        let configs: [(name: String, nCtx: UInt32, flashAttn: Bool, kvType: Int32)] = [
+            ("baseline (8K, no FA)",        8192, false, -1),
+            ("flash_attn ON (8K)",          8192, true,  -1),
+            ("ctx=2K, no FA",               2048, false, -1),
+            ("ctx=2K + flash_attn",         2048, true,  -1),
+            ("ctx=4K + flash_attn",         4096, true,  -1),
+        ]
 
-        // --- Test C: Engine speculative first ---
-        print("--- C: Engine speculative ---")
-        let specTps = try await engineBenchShared(engine: engine, prompt: prompt, maxTokens: maxTokens, speculative: true)
+        var results: [(String, Double)] = []
 
-        // --- Test B: Engine greedy ---
-        print("\n--- B: Engine greedy (no spec) ---")
-        let greedyTps = try await engineBenchShared(engine: engine, prompt: prompt, maxTokens: maxTokens, speculative: false)
+        for config in configs {
+            print("--- \(config.name) ---")
+            let tps = try benchConfig(
+                modelPath: modelPath,
+                prompt: prompt,
+                maxTokens: maxTokens,
+                nCtx: config.nCtx,
+                flashAttn: config.flashAttn
+            )
+            results.append((config.name, tps))
+            print("")
+        }
 
-        // Raw C benchmark last
-        print("\n--- A: Raw C API (reference) ---")
-        let rawTps = try await rawBench(modelPath: modelPath, prompt: prompt, tg: maxTokens)
-
-        // --- Summary ---
-        print("\n=== Summary ===")
-        print("A) Raw C:           \(String(format: "%6.1f", rawTps)) tok/s")
-        print("B) Engine greedy:   \(String(format: "%6.1f", greedyTps)) tok/s")
-        print("C) Engine spec:     \(String(format: "%6.1f", specTps)) tok/s")
-        print("B/A overhead:       \(String(format: "%.1f%%", (1.0 - greedyTps/rawTps) * 100))")
-        if specTps > greedyTps {
-            print("C/B spec speedup:   \(String(format: "%.2fx", specTps/greedyTps))")
+        // Summary
+        print("=== Summary ===")
+        let baseline = results[0].1
+        for (name, tps) in results {
+            let delta = baseline > 0 ? (tps / baseline - 1) * 100 : 0
+            let sign = delta >= 0 ? "+" : ""
+            print("  \(String(format: "%-30s", (name as NSString).utf8String!))  \(String(format: "%6.1f", tps)) tok/s  (\(sign)\(String(format: "%.1f", delta))%)")
         }
     }
 
-    // MARK: - Raw C bench
-
-    static func rawBench(modelPath: String, prompt: String, tg: Int) async throws -> Double {
+    static func benchConfig(
+        modelPath: String,
+        prompt: String,
+        maxTokens: Int,
+        nCtx: UInt32,
+        flashAttn: Bool
+    ) throws -> Double {
         llama_backend_init()
         defer { llama_backend_free() }
 
@@ -66,13 +76,19 @@ struct BenchMain {
         defer { llama_model_free(model) }
 
         var cparams = llama_context_default_params()
-        cparams.n_ctx = 8192
+        cparams.n_ctx = nCtx
         cparams.n_batch = 2048
         let nThreads = max(1, min(8, ProcessInfo.processInfo.processorCount - 2))
         cparams.n_threads = Int32(nThreads)
         cparams.n_threads_batch = Int32(nThreads)
+        if flashAttn {
+            cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED
+        }
 
-        guard let ctx = llama_init_from_model(model, cparams) else { return 0 }
+        guard let ctx = llama_init_from_model(model, cparams) else {
+            print("  context init failed (flash_attn=\(flashAttn) may not be supported)")
+            return 0
+        }
         defer { llama_free(ctx) }
         guard let vocab = llama_model_get_vocab(model) else { return 0 }
 
@@ -81,8 +97,8 @@ struct BenchMain {
         llama_sampler_chain_add(smpl, llama_sampler_init_greedy())
         defer { llama_sampler_free(smpl) }
 
+        // Tokenize
         let promptTokens = tokenize(vocab: vocab, text: prompt)
-        print("  Prompt: \(promptTokens.count) tokens")
 
         var batch = llama_batch_init(2048, 0, 1)
         defer { llama_batch_free(batch) }
@@ -92,15 +108,18 @@ struct BenchMain {
         for (i, tok) in promptTokens.enumerated() {
             llama_batch_add(&batch, tok, Int32(i), [0], i == promptTokens.count - 1)
         }
+        let ppStart = DispatchTime.now().uptimeNanoseconds
         llama_decode(ctx, batch)
         llama_synchronize(ctx)
+        let ppEnd = DispatchTime.now().uptimeNanoseconds
+        let ppTps = Double(promptTokens.count) / (Double(ppEnd - ppStart) / 1e9)
 
         // Decode
         var nCur = Int32(promptTokens.count)
         var decoded = 0
         let t0 = DispatchTime.now().uptimeNanoseconds
 
-        for _ in 0..<tg {
+        for _ in 0..<maxTokens {
             let tok = llama_sampler_sample(smpl, ctx, -1)
             if llama_vocab_is_eog(vocab, tok) { break }
             llama_batch_clear(&batch)
@@ -113,37 +132,7 @@ struct BenchMain {
 
         let elapsed = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9
         let tps = Double(decoded) / elapsed
-        print("  Decode: \(decoded) tokens, \(String(format: "%.2f", elapsed))s, \(String(format: "%.1f", tps)) tok/s")
-        return tps
-    }
-
-    // MARK: - Engine bench (shared instance)
-
-    static func engineBenchShared(engine: MetalLLMEngine, prompt: String, maxTokens: Int, speculative: Bool) async throws -> Double {
-        let config = SamplingConfig(
-            temperature: 0.0,
-            maxTokens: Int(maxTokens),
-            speculative: speculative
-        )
-
-        nonisolated(unsafe) var output = ""
-        nonisolated(unsafe) var tokenCount = 0
-        let t0 = CFAbsoluteTimeGetCurrent()
-
-        try await engine.generate(prompt: prompt, config: config) { event in
-            output += event.token
-            tokenCount += 1
-        }
-
-        let elapsed = CFAbsoluteTimeGetCurrent() - t0
-        let tps = elapsed > 0 ? Double(tokenCount) / elapsed : 0
-
-        let snap = await engine.metricsSnapshot()
-        print("  Output: \(output.prefix(120))...")
-        print("  Decode: \(tokenCount) tokens, \(String(format: "%.2f", elapsed))s, \(String(format: "%.1f", tps)) tok/s")
-        if speculative {
-            print("  Acceptance: \(String(format: "%.1f%%", snap.acceptanceRate * 100)), bursts: \(snap.specBursts)")
-        }
+        print("  pp=\(String(format: "%.0f", ppTps)) tok/s, tg=\(decoded) tokens, \(String(format: "%.1f", tps)) tok/s")
         return tps
     }
 
