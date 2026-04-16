@@ -157,6 +157,13 @@ public actor LlamaContext {
         return ""
     }
 
+    /// Combined detokenize + EOG check in one actor hop.
+    public func detokenizeAndCheckEOG(_ token: llama_token) -> (text: String, isEOG: Bool) {
+        let text = detokenize(token)
+        let eog = llama_vocab_is_eog(vocab, token)
+        return (text, eog)
+    }
+
     public func isEOG(_ token: llama_token) -> Bool {
         llama_vocab_is_eog(vocab, token)
     }
@@ -214,6 +221,25 @@ public actor LlamaContext {
         nCur += 1
         nDecode += 1
         return newToken
+    }
+
+    /// Combined sample + decode + detokenize + EOG check in one actor hop.
+    public func sampleDecodeAndEmit() throws -> (tokenId: llama_token, text: String, isEOG: Bool) {
+        let tokenId = llama_sampler_sample(sampling, context, -1)
+        let text = detokenize(tokenId)
+        let eog = llama_vocab_is_eog(vocab, tokenId)
+
+        if !eog {
+            llama_batch_clear(&batch)
+            llama_batch_add(&batch, tokenId, nCur, [0], true)
+            guard llama_decode(context, batch) == 0 else {
+                throw LlamaContextError.decodeFailed("decode step \(nCur)")
+            }
+            nCur += 1
+            nDecode += 1
+        }
+
+        return (tokenId, text, eog)
     }
 
     // MARK: - Multi-token verify (for speculative decoding)

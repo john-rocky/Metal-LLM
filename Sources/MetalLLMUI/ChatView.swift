@@ -80,7 +80,7 @@ public final class ChatViewModel {
             speculative: true
         )
 
-        let stream = await engine.generate(prompt: prompt, config: config)
+        let stream = await engine.generateStream(prompt: prompt, config: config)
         do {
             for try await event in stream {
                 if let idx = messages.indices.last {

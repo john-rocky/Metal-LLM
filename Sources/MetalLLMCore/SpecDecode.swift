@@ -91,50 +91,26 @@ public final class SpecDecodeOrchestrator: @unchecked Sendable {
     }
 
     /// Run one speculative burst: draft K tokens, verify, accept prefix.
-    public func step(ctx: LlamaContext) async throws -> SpecDecodeResult {
+    /// Returns nil if drafter has nothing — caller should use greedy path.
+    public func step(ctx: LlamaContext) async throws -> SpecDecodeResult? {
+        let activeDrafter: ExternalDrafter? = drafter
+        guard let activeDrafter, rollingAccept >= fallbackThreshold else {
+            return nil  // signal caller to use greedy
+        }
+
         // Sample the "anchor" token from the current context
         let anchor = await ctx.sampleAt(-1)
-
-        // Check if we should use speculative decoding
-        let activeDrafter: ExternalDrafter = drafter ?? promptLookup
-        let useSpec = rollingAccept >= fallbackThreshold
-
-        if !useSpec {
-            // Fallback to vanilla decode
-            let pos = await ctx.nCur
-
-            // Decode the anchor token
-            try await ctx.verifyBatch(tokens: [anchor], startPos: pos)
-            await ctx.advancePosition(by: 1)
-            lastToken = anchor
-            await promptLookup.updateHistory([anchor])
-
-            // Update rolling acceptance (toward fallback exit)
-            rollingAccept = alpha * 0 + (1 - alpha) * rollingAccept
-
-            return SpecDecodeResult(emitted: [anchor], accepted: 0, drafted: 0)
-        }
 
         // Draft K tokens
         let proposals: [Int32]
         do {
             proposals = try await activeDrafter.draft(lastToken: anchor, maxTokens: K)
         } catch {
-            // Drafter failed — fall back to vanilla
-            let pos = await ctx.nCur
-            try await ctx.verifyBatch(tokens: [anchor], startPos: pos)
-            await ctx.advancePosition(by: 1)
-            lastToken = anchor
-            return SpecDecodeResult(emitted: [anchor], accepted: 0, drafted: 0)
+            return nil
         }
 
         guard !proposals.isEmpty else {
-            // No proposals — vanilla decode
-            let pos = await ctx.nCur
-            try await ctx.verifyBatch(tokens: [anchor], startPos: pos)
-            await ctx.advancePosition(by: 1)
-            lastToken = anchor
-            return SpecDecodeResult(emitted: [anchor], accepted: 0, drafted: 0)
+            return nil
         }
 
         // Build verify batch: [anchor, draft_0, draft_1, ..., draft_{K-1}]
