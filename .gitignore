@@ -38,6 +38,12 @@ Benchmarks/**/*.csv
 Benchmarks/**/*.log
 !Benchmarks/Baseline/.gitkeep
 
+# XCFramework (built locally, not committed)
+Frameworks/
+
+# llama.cpp build artifacts
+External/llama.cpp/build*/
+
 # Output
 output/
 tmp/

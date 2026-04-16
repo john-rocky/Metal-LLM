@@ -2,9 +2,8 @@
 //  EngineTests.swift
 //  MetalLLMCoreTests
 //
-//  Placeholder test target. Real tests arrive alongside the Week 1 llama.cpp
-//  integration (load-model smoke test, tokenizer round-trip) and Week 5 spec-decode
-//  work (drafter/verifier agreement tests).
+//  Basic integration tests for the Metal-LLM engine.
+//  Note: Full model tests require a GGUF on disk and run on-device only.
 //
 
 import XCTest
@@ -12,13 +11,49 @@ import XCTest
 
 final class EngineTests: XCTestCase {
 
-    func testEngineInitialises() {
-        let engine = MetalLLMEngine()
-        _ = engine.metricsSnapshot()
-        // TODO(Week 1): assert initial metrics are zeroed.
+    func testSamplingConfigDefaults() {
+        let config = SamplingConfig()
+        XCTAssertEqual(config.temperature, 0.0)
+        XCTAssertEqual(config.topK, 40)
+        XCTAssertEqual(config.maxTokens, 512)
+        XCTAssertTrue(config.speculative)
     }
 
-    // TODO(Week 1): testLoadModel_smallGGUF
-    // TODO(Week 1): testTokenizerRoundTrip
-    // TODO(Week 5): testDrafterAgreesWithVerifierAtTemperatureZero
+    func testMetricsCollectorBasic() {
+        let collector = MetricsCollector()
+        collector.beginDecode()
+        collector.recordDecodedTokens(10)
+
+        let snap = collector.snapshot()
+        XCTAssertEqual(snap.tokensGenerated, 10)
+        XCTAssertGreaterThan(snap.decodeTokensPerSecond, 0)
+    }
+
+    func testPromptLookupDrafter() async throws {
+        let drafter = PromptLookupDrafter(ngramSize: 2)
+        drafter.updateHistory([1, 2, 3, 4, 5, 1, 2])
+
+        let proposals = try await drafter.draft(lastToken: 2, maxTokens: 3)
+        XCTAssertEqual(proposals, [3, 4, 5])
+    }
+
+    func testPromptLookupNoMatch() async throws {
+        let drafter = PromptLookupDrafter(ngramSize: 2)
+        drafter.updateHistory([1, 2, 3])
+
+        let proposals = try await drafter.draft(lastToken: 3, maxTokens: 3)
+        XCTAssertTrue(proposals.isEmpty)
+    }
+
+    func testSpecDecodeOrchestratorInit() {
+        let orch = SpecDecodeOrchestrator()
+        XCTAssertEqual(orch.K, 3)
+        XCTAssertEqual(orch.fallbackThreshold, 0.30)
+    }
+
+    func testEngineInitialises() async {
+        let engine = MetalLLMEngine()
+        let snap = await engine.metricsSnapshot()
+        XCTAssertEqual(snap.tokensGenerated, 0)
+    }
 }

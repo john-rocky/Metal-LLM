@@ -2,72 +2,186 @@
 //  SpecDecode.swift
 //  MetalLLMCore
 //
-//  Orchestrator for speculative decoding. Multiple drafters (EAGLE-3, MTP,
-//  prompt-lookup) share a single verifier (llama.cpp target model). The orchestrator
-//  picks which drafter to use per-step based on acceptance-rate feedback and latency
-//  budget, and handles rollback when drafts are rejected.
+//  Speculative decoding orchestrator. Supports:
+//  - Prompt-lookup (n-gram) drafter (built-in, zero-cost)
+//  - External drafter protocol (MTP via ANE, EAGLE-3 — Phase 2+)
+//  - Greedy verification with rollback
+//
+//  The orchestrator runs draft → verify → accept/reject in bursts.
+//  K=3 fixed, matching Google LiteRT-LM's MTP configuration.
 //
 
 import Foundation
 
-/// A speculative draft — a short run of candidate token ids plus the drafter's own
-/// logits (used by rejection sampling when temperature > 0).
-public struct Draft {
-    public let tokens: [Int32]
-    public let logits: [[Float]]?       // per-position drafter logits, optional
-    public let source: DrafterKind
+// MARK: - Spec decode result
+
+public struct SpecDecodeResult {
+    public let emitted: [Int32]   // accepted tokens + bonus
+    public let accepted: Int       // how many draft tokens matched
+    public let drafted: Int        // how many were drafted (K)
 }
 
-public enum DrafterKind: String {
-    case eagle3
-    case mtp
-    case promptLookup
+// MARK: - External drafter protocol
+
+public protocol ExternalDrafter: AnyObject, Sendable {
+    func draft(lastToken: Int32, maxTokens: Int) async throws -> [Int32]
 }
 
-/// Common interface every drafter implements.
-public protocol Drafter: AnyObject {
-    var kind: DrafterKind { get }
+// MARK: - Prompt-lookup drafter
 
-    /// Produce up to `maxTokens` speculative continuation tokens given the accepted
-    /// context so far.
-    func draft(context: [Int32], maxTokens: Int) throws -> Draft
+public actor PromptLookupDrafter: ExternalDrafter {
+    private var history: [Int32] = []
+    private let ngramSize: Int
 
-    /// Feedback hook so the drafter can update its own state (e.g. EAGLE-3 hidden
-    /// states) based on the verifier's acceptance decision.
-    func commitAcceptance(accepted: [Int32], rejectedSuffix: [Int32])
+    public init(ngramSize: Int = 3) {
+        self.ngramSize = ngramSize
+    }
+
+    public func updateHistory(_ tokens: [Int32]) {
+        history.append(contentsOf: tokens)
+        if history.count > 4096 {
+            history = Array(history.suffix(4096))
+        }
+    }
+
+    public func draft(lastToken: Int32, maxTokens: Int) async throws -> [Int32] {
+        guard history.count >= ngramSize else { return [] }
+
+        let tail = Array(history.suffix(ngramSize))
+        let searchEnd = history.count - ngramSize
+
+        for i in stride(from: searchEnd - 1, through: 0, by: -1) {
+            var match = true
+            for j in 0..<ngramSize {
+                if history[i + j] != tail[j] {
+                    match = false
+                    break
+                }
+            }
+            if match {
+                let start = i + ngramSize
+                let end = min(start + maxTokens, history.count)
+                if start < end {
+                    return Array(history[start..<end])
+                }
+            }
+        }
+        return []
+    }
 }
 
-/// The orchestrator. Skeleton — no scheduling heuristic yet.
-public final class SpecDecodeOrchestrator {
+// MARK: - Orchestrator
 
-    private var drafters: [DrafterKind: Drafter] = [:]
-    private var acceptanceRates: [DrafterKind: Double] = [:]
+public final class SpecDecodeOrchestrator: @unchecked Sendable {
+    public let K: Int = 3
+
+    private var rollingAccept: Double = 1.0
+    private let alpha: Double = 0.05
+    public var fallbackThreshold: Double = 0.30
+
+    private var drafter: ExternalDrafter?
+    private let promptLookup = PromptLookupDrafter()
+
+    private var lastToken: Int32 = -1
 
     public init() {}
 
-    public func register(_ drafter: Drafter) {
-        drafters[drafter.kind] = drafter
-        acceptanceRates[drafter.kind] = 0
+    public func setDrafter(_ d: ExternalDrafter?) {
+        self.drafter = d
     }
 
-    /// Pick a drafter and return a draft for the current step.
-    public func proposeDraft(context: [Int32], maxTokens: Int) throws -> Draft? {
-        // TODO(Week 5): route by rolling acceptance rate + measured draft latency.
-        // TODO(Week 11): Mirror-SD path — run GPU draft and ANE verify in parallel.
-        return nil
-    }
+    /// Run one speculative burst: draft K tokens, verify, accept prefix.
+    public func step(ctx: LlamaContext) async throws -> SpecDecodeResult {
+        // Sample the "anchor" token from the current context
+        let anchor = await ctx.sampleAt(-1)
 
-    /// Called by the engine after the verifier decides which prefix of a draft to keep.
-    public func commit(draft: Draft, acceptedCount: Int) {
-        // TODO(Week 5): update acceptance stats, forward to the source drafter.
-    }
-}
+        // Check if we should use speculative decoding
+        let activeDrafter: ExternalDrafter = drafter ?? promptLookup
+        let useSpec = rollingAccept >= fallbackThreshold
 
-/// Verifier interface — the "big" model that scores drafts. In Week 1+ this is
-/// `LlamaBridge.decode(returnAllLogits: true)`.
-public protocol Verifier: AnyObject {
-    /// Score a draft: returns the number of leading tokens accepted plus the
-    /// bonus token sampled from the verifier's own distribution at the first
-    /// rejected position.
-    func verify(context: [Int32], draft: Draft, temperature: Float) throws -> (accepted: Int, bonus: Int32)
+        if !useSpec {
+            // Fallback to vanilla decode
+            let pos = await ctx.nCur
+
+            // Decode the anchor token
+            try await ctx.verifyBatch(tokens: [anchor], startPos: pos)
+            await ctx.advancePosition(by: 1)
+            lastToken = anchor
+            await promptLookup.updateHistory([anchor])
+
+            // Update rolling acceptance (toward fallback exit)
+            rollingAccept = alpha * 0 + (1 - alpha) * rollingAccept
+
+            return SpecDecodeResult(emitted: [anchor], accepted: 0, drafted: 0)
+        }
+
+        // Draft K tokens
+        let proposals: [Int32]
+        do {
+            proposals = try await activeDrafter.draft(lastToken: anchor, maxTokens: K)
+        } catch {
+            // Drafter failed — fall back to vanilla
+            let pos = await ctx.nCur
+            try await ctx.verifyBatch(tokens: [anchor], startPos: pos)
+            await ctx.advancePosition(by: 1)
+            lastToken = anchor
+            return SpecDecodeResult(emitted: [anchor], accepted: 0, drafted: 0)
+        }
+
+        guard !proposals.isEmpty else {
+            // No proposals — vanilla decode
+            let pos = await ctx.nCur
+            try await ctx.verifyBatch(tokens: [anchor], startPos: pos)
+            await ctx.advancePosition(by: 1)
+            lastToken = anchor
+            return SpecDecodeResult(emitted: [anchor], accepted: 0, drafted: 0)
+        }
+
+        // Build verify batch: [anchor, draft_0, draft_1, ..., draft_{K-1}]
+        let verifyTokens = [anchor] + proposals
+        let pos = await ctx.nCur
+
+        try await ctx.verifyBatch(tokens: verifyTokens, startPos: pos)
+
+        // Greedy acceptance: compare verifier argmax against proposals
+        var matched = 0
+        for k in 0..<proposals.count {
+            let verifierChoice = await ctx.argmaxAt(Int32(k))
+            if verifierChoice == proposals[k] {
+                matched += 1
+            } else {
+                break
+            }
+        }
+
+        // Bonus token: verifier's choice at the first disagreement position
+        let bonusToken = await ctx.argmaxAt(Int32(matched))
+
+        // Build emitted sequence
+        var emitted: [Int32] = [anchor]
+        emitted.append(contentsOf: proposals.prefix(matched))
+        emitted.append(bonusToken)
+
+        let totalAdvance = Int32(matched + 1)
+        // Truncate KV for rejected positions
+        let keepPos = pos + totalAdvance
+        await ctx.kvRemove(seqId: 0, p0: keepPos, p1: -1)
+
+        // Now decode the bonus token to prepare KV for next step
+        try await ctx.verifyBatch(tokens: [bonusToken], startPos: keepPos)
+        await ctx.setPosition(keepPos + 1)
+
+        lastToken = bonusToken
+        await promptLookup.updateHistory(emitted)
+
+        // Update rolling acceptance
+        let rate = proposals.isEmpty ? 0 : Double(matched) / Double(proposals.count)
+        rollingAccept = alpha * rate + (1 - alpha) * rollingAccept
+
+        return SpecDecodeResult(
+            emitted: emitted,
+            accepted: matched,
+            drafted: proposals.count
+        )
+    }
 }

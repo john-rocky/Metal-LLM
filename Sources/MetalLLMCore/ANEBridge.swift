@@ -6,13 +6,12 @@
 //
 //    1. Prefill offload — reuse the chunk models from the sibling CoreML-LLM repo
 //       to burn through long prompts on the ANE while the GPU is idle, then hand
-//       the KV cache to the Metal decode path.
+//       the KV cache to the Metal decode path via IOSurface zero-copy.
 //
-//    2. ANE-hosted drafter — run an EAGLE/MTP drafter on the ANE while the Metal
-//       verifier runs on the GPU. Mirror-SD (Week 11).
+//    2. ANE-hosted MTP drafter — run the MTP drafter on the ANE while the Metal
+//       verifier runs on the GPU. Mirror-SD pattern.
 //
-//  Shared state between ANE and Metal goes through IOSurface when layouts permit
-//  zero-copy; otherwise we fall back to a single CPU-resident staging buffer.
+//  Phase 3 implementation. Interface defined now for Engine integration.
 //
 
 import Foundation
@@ -20,45 +19,96 @@ import Foundation
 import CoreML
 #endif
 
-/// Configuration for the ANE bridge.
-public struct ANEBridgeConfig {
-    /// Location of the CoreML-LLM chunk models (the sibling repo's converted output).
-    public var chunkModelsDirectory: URL
-    /// Whether to use the ANE drafter path (Week 11).
-    public var enableDrafter: Bool
+// MARK: - Configuration
 
-    public init(chunkModelsDirectory: URL, enableDrafter: Bool = false) {
+public struct ANEBridgeConfig: Sendable {
+    public var chunkModelsDirectory: URL
+    public var drafterModelURL: URL?
+    public var enableDrafter: Bool
+    public var enablePrefill: Bool
+
+    public init(
+        chunkModelsDirectory: URL,
+        drafterModelURL: URL? = nil,
+        enableDrafter: Bool = false,
+        enablePrefill: Bool = true
+    ) {
         self.chunkModelsDirectory = chunkModelsDirectory
+        self.drafterModelURL = drafterModelURL
         self.enableDrafter = enableDrafter
+        self.enablePrefill = enablePrefill
     }
 }
 
-/// ANE bridge. Skeleton — actual Core ML integration arrives Week 7.
-public final class ANEBridge {
+// MARK: - ANE Bridge
 
+public actor ANEBridge {
     private let config: ANEBridgeConfig
+    private var isReady = false
 
     public init(config: ANEBridgeConfig) {
         self.config = config
     }
 
-    // MARK: - Prefill
+    // MARK: - Lifecycle
 
-    /// Prefill the KV cache on the ANE for a tokenized prompt. Returns a KV blob
-    /// that `LlamaBridge` can ingest (same layout as llama.cpp's internal cache).
-    public func prefill(tokens: [Int32]) async throws -> Data {
-        // TODO(Week 7): load chunk_0..chunk_N .mlpackage via MLModel with
-        //               .cpuAndNeuralEngine compute units.
-        // TODO(Week 7): stream through chunks, reshape output KV into llama.cpp layout.
-        // TODO(Week 8): IOSurface zero-copy handoff where Metal KV layout matches.
-        fatalError("ANEBridge.prefill not implemented — Week 7 milestone")
+    public func warmup() async throws {
+        // Phase 3: Load and compile Core ML models
+        // - Load chunk1..4 for prefill
+        // - Load MTP drafter for Mirror SD
+        // - Prewarm compute plans
+        isReady = true
     }
 
-    // MARK: - Drafter (Mirror-SD)
+    // MARK: - Prefill (Phase 3)
 
-    /// Run the ANE-hosted drafter for one step. Called in parallel with Metal decode.
-    public func draftStep(context: [Int32], maxTokens: Int) async throws -> [Int32] {
-        // TODO(Week 11): Mirror-SD — dispatch ANE drafter while Metal verifier runs.
-        fatalError("ANEBridge.draftStep not implemented — Week 11 milestone")
+    /// Prefill the KV cache on ANE for a tokenized prompt.
+    /// Returns the number of tokens processed.
+    public func prefill(tokens: [Int32], kvSlab: SharedKVSlab?) async throws -> Int {
+        guard isReady else {
+            throw ANEBridgeError.notReady
+        }
+        // Phase 3 implementation:
+        // 1. Load chunk models
+        // 2. Run in 128-token batches through ANE
+        // 3. Write KV into shared IOSurface slab
+        // 4. Return token count
+        fatalError("ANEBridge.prefill — Phase 3 milestone")
     }
+
+    // MARK: - MTP Drafter (Phase 3 — Mirror SD)
+
+    /// Run one MTP draft step on ANE. Returns up to K draft tokens.
+    public func draftStep(
+        lastToken: Int32,
+        activations: [Float]?,
+        maxTokens: Int
+    ) async throws -> [Int32] {
+        guard isReady, config.enableDrafter else {
+            throw ANEBridgeError.drafterNotAvailable
+        }
+        // Phase 3 implementation:
+        // 1. Embed token
+        // 2. Concat with activations
+        // 3. Run drafter model on ANE
+        // 4. Argmax to get draft tokens
+        fatalError("ANEBridge.draftStep — Phase 3 milestone")
+    }
+}
+
+// MARK: - SharedKVSlab placeholder (Phase 3)
+
+/// IOSurface-backed KV cache shared between ANE and Metal.
+/// Full implementation in Phase 3.
+public final class SharedKVSlab: @unchecked Sendable {
+    // Phase 3: CVPixelBuffer + IOSurface + MLMultiArray + MTLBuffer views
+    public init() {}
+}
+
+// MARK: - Errors
+
+public enum ANEBridgeError: Error {
+    case notReady
+    case drafterNotAvailable
+    case prefillFailed(String)
 }
