@@ -29,26 +29,35 @@ final class EngineTests: XCTestCase {
         XCTAssertGreaterThan(snap.decodeTokensPerSecond, 0)
     }
 
-    func testPromptLookupDrafter() async throws {
-        let drafter = PromptLookupDrafter(ngramSize: 2)
-        await drafter.updateHistory([1, 2, 3, 4, 5, 1, 2])
+    func testNgramDrafterMatch() {
+        let drafter = NgramDrafter(ngramMin: 2, ngramMax: 4)
+        drafter.feedTokens([1, 2, 3, 4, 5, 1, 2])
 
-        let proposals = try await drafter.draft(lastToken: 2, maxTokens: 3)
+        let proposals = drafter.draft(maxTokens: 3)
         XCTAssertEqual(proposals, [3, 4, 5])
     }
 
-    func testPromptLookupNoMatch() async throws {
-        let drafter = PromptLookupDrafter(ngramSize: 2)
-        await drafter.updateHistory([1, 2, 3])
+    func testNgramDrafterNoMatch() {
+        let drafter = NgramDrafter(ngramMin: 2, ngramMax: 4)
+        drafter.feedTokens([1, 2, 3])
 
-        let proposals = try await drafter.draft(lastToken: 3, maxTokens: 3)
+        let proposals = drafter.draft(maxTokens: 3)
         XCTAssertTrue(proposals.isEmpty)
+    }
+
+    func testNgramDrafterLongerMatch() {
+        let drafter = NgramDrafter(ngramMin: 2, ngramMax: 4)
+        // Pattern: [10, 20, 30, 40, 50, 10, 20, 30]
+        // Should find [10, 20, 30] match and propose [40, 50]
+        drafter.feedTokens([10, 20, 30, 40, 50, 10, 20, 30])
+        let proposals = drafter.draft(maxTokens: 3)
+        XCTAssertEqual(proposals, [40, 50, 10])
     }
 
     func testSpecDecodeOrchestratorInit() {
         let orch = SpecDecodeOrchestrator()
         XCTAssertEqual(orch.K, 3)
-        XCTAssertEqual(orch.fallbackThreshold, 0.30)
+        XCTAssertEqual(orch.fallbackThreshold, 0.15)
     }
 
     func testEngineInitialises() async {

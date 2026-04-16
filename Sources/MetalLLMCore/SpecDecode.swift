@@ -2,23 +2,19 @@
 //  SpecDecode.swift
 //  MetalLLMCore
 //
-//  Speculative decoding orchestrator. Supports:
-//  - Prompt-lookup (n-gram) drafter (built-in, zero-cost)
-//  - External drafter protocol (MTP via ANE, EAGLE-3 — Phase 2+)
-//  - Greedy verification with rollback
-//
-//  The orchestrator runs draft → verify → accept/reject in bursts.
-//  K=3 fixed, matching Google LiteRT-LM's MTP configuration.
+//  Speculative decoding orchestrator with n-gram prompt-lookup drafter.
+//  Draft → verify → accept/reject → KV rollback pipeline.
+//  K=3, greedy verification, rolling acceptance EMA with fallback.
 //
 
 import Foundation
 
-// MARK: - Spec decode result
+// MARK: - Result
 
-public struct SpecDecodeResult {
-    public let emitted: [Int32]   // accepted tokens + bonus
-    public let accepted: Int       // how many draft tokens matched
-    public let drafted: Int        // how many were drafted (K)
+public struct SpecDecodeResult: Sendable {
+    public let emitted: [Int32]
+    public let accepted: Int
+    public let drafted: Int
 }
 
 // MARK: - External drafter protocol
@@ -27,42 +23,56 @@ public protocol ExternalDrafter: AnyObject, Sendable {
     func draft(lastToken: Int32, maxTokens: Int) async throws -> [Int32]
 }
 
-// MARK: - Prompt-lookup drafter
+// MARK: - N-gram drafter (built-in, zero-cost)
 
-public actor PromptLookupDrafter: ExternalDrafter {
+/// Thread-safe n-gram drafter. Uses a simple array + lock instead of actor
+/// to avoid async overhead in the hot path.
+public final class NgramDrafter: @unchecked Sendable {
     private var history: [Int32] = []
-    private let ngramSize: Int
+    private let ngramMin: Int
+    private let ngramMax: Int
+    private let lock = NSLock()
 
-    public init(ngramSize: Int = 3) {
-        self.ngramSize = ngramSize
+    public init(ngramMin: Int = 2, ngramMax: Int = 4) {
+        self.ngramMin = ngramMin
+        self.ngramMax = ngramMax
     }
 
-    public func updateHistory(_ tokens: [Int32]) {
+    public func feedTokens(_ tokens: [Int32]) {
+        lock.lock()
         history.append(contentsOf: tokens)
-        if history.count > 4096 {
-            history = Array(history.suffix(4096))
-        }
+        if history.count > 8192 { history = Array(history.suffix(8192)) }
+        lock.unlock()
     }
 
-    public func draft(lastToken: Int32, maxTokens: Int) async throws -> [Int32] {
-        guard history.count >= ngramSize else { return [] }
+    public func feedPromptTokens(_ tokens: [Int32]) {
+        lock.lock()
+        history = tokens
+        lock.unlock()
+    }
 
-        let tail = Array(history.suffix(ngramSize))
-        let searchEnd = history.count - ngramSize
+    /// Synchronous draft — no async, no actor hop.
+    public func draft(maxTokens: Int) -> [Int32] {
+        lock.lock()
+        defer { lock.unlock() }
 
-        for i in stride(from: searchEnd - 1, through: 0, by: -1) {
-            var match = true
-            for j in 0..<ngramSize {
-                if history[i + j] != tail[j] {
-                    match = false
-                    break
+        // Try decreasing n-gram sizes for best match
+        for n in stride(from: ngramMax, through: ngramMin, by: -1) {
+            guard history.count >= n else { continue }
+            let tail = Array(history.suffix(n))
+            let searchEnd = history.count - n
+
+            for i in stride(from: searchEnd - 1, through: 0, by: -1) {
+                var match = true
+                for j in 0..<n {
+                    if history[i + j] != tail[j] { match = false; break }
                 }
-            }
-            if match {
-                let start = i + ngramSize
-                let end = min(start + maxTokens, history.count)
-                if start < end {
-                    return Array(history[start..<end])
+                if match {
+                    let start = i + n
+                    let end = min(start + maxTokens, history.count)
+                    if start < end {
+                        return Array(history[start..<end])
+                    }
                 }
             }
         }
@@ -73,91 +83,62 @@ public actor PromptLookupDrafter: ExternalDrafter {
 // MARK: - Orchestrator
 
 public final class SpecDecodeOrchestrator: @unchecked Sendable {
-    public let K: Int = 3
+    public var K: Int = 3
 
-    private var rollingAccept: Double = 1.0
-    private let alpha: Double = 0.05
-    public var fallbackThreshold: Double = 0.30
+    private var rollingAccept: Double = 0.5
+    private let alpha: Double = 0.15
+    public var fallbackThreshold: Double = 0.20
+    private var consecutiveMisses: Int = 0
+    private let maxConsecutiveMisses: Int = 3
 
-    private var drafter: ExternalDrafter?
-    private let promptLookup = PromptLookupDrafter()
+    private var externalDrafter: ExternalDrafter?
+    public let ngramDrafter = NgramDrafter()
 
-    private var lastToken: Int32 = -1
+    private var totalDrafted: Int = 0
+    private var totalAccepted: Int = 0
+    private var totalBursts: Int = 0
 
     public init() {}
 
-    public func setDrafter(_ d: ExternalDrafter?) {
-        self.drafter = d
+    public func setExternalDrafter(_ d: ExternalDrafter?) {
+        self.externalDrafter = d
     }
 
-    /// Run one speculative burst: draft K tokens, verify, accept prefix.
-    /// Returns nil if drafter has nothing — caller should use greedy path.
+    /// Run one speculative burst. All LlamaContext calls batched
+    /// into minimal actor hops via combined methods.
     public func step(ctx: LlamaContext) async throws -> SpecDecodeResult? {
-        let activeDrafter: ExternalDrafter? = drafter
-        guard let activeDrafter, rollingAccept >= fallbackThreshold else {
-            return nil  // signal caller to use greedy
-        }
-
-        // Sample the "anchor" token from the current context
-        let anchor = await ctx.sampleAt(-1)
-
-        // Draft K tokens
-        let proposals: [Int32]
-        do {
-            proposals = try await activeDrafter.draft(lastToken: anchor, maxTokens: K)
-        } catch {
-            return nil
-        }
+        // Get draft proposals (synchronous, no actor hop)
+        let proposals = ngramDrafter.draft(maxTokens: K)
 
         guard !proposals.isEmpty else {
-            return nil
+            consecutiveMisses += 1
+            return nil  // no proposals → caller uses greedy
         }
 
-        // Build verify batch: [anchor, draft_0, draft_1, ..., draft_{K-1}]
-        let verifyTokens = [anchor] + proposals
-        let pos = await ctx.nCur
+        // Reset miss counter — we have proposals to try
+        consecutiveMisses = 0
 
-        try await ctx.verifyBatch(tokens: verifyTokens, startPos: pos)
+        // Single actor hop: sample anchor + verify batch + argmax all + manage KV
+        let result = try await ctx.speculativeVerify(proposals: proposals)
 
-        // Greedy acceptance: compare verifier argmax against proposals
-        var matched = 0
-        for k in 0..<proposals.count {
-            let verifierChoice = await ctx.argmaxAt(Int32(k))
-            if verifierChoice == proposals[k] {
-                matched += 1
-            } else {
-                break
-            }
-        }
+        // Feed accepted tokens to n-gram history
+        ngramDrafter.feedTokens(result.emitted)
 
-        // Bonus token: verifier's choice at the first disagreement position
-        let bonusToken = await ctx.argmaxAt(Int32(matched))
-
-        // Build emitted sequence
-        var emitted: [Int32] = [anchor]
-        emitted.append(contentsOf: proposals.prefix(matched))
-        emitted.append(bonusToken)
-
-        let totalAdvance = Int32(matched + 1)
-        // Truncate KV for rejected positions
-        let keepPos = pos + totalAdvance
-        await ctx.kvRemove(seqId: 0, p0: keepPos, p1: -1)
-
-        // Now decode the bonus token to prepare KV for next step
-        try await ctx.verifyBatch(tokens: [bonusToken], startPos: keepPos)
-        await ctx.setPosition(keepPos + 1)
-
-        lastToken = bonusToken
-        await promptLookup.updateHistory(emitted)
+        // Stats
+        totalDrafted += proposals.count
+        totalAccepted += result.accepted
+        totalBursts += 1
 
         // Update rolling acceptance
-        let rate = proposals.isEmpty ? 0 : Double(matched) / Double(proposals.count)
+        let rate = Double(result.accepted) / Double(proposals.count)
         rollingAccept = alpha * rate + (1 - alpha) * rollingAccept
 
-        return SpecDecodeResult(
-            emitted: emitted,
-            accepted: matched,
-            drafted: proposals.count
-        )
+        return result
     }
+
+    public var acceptanceRate: Double {
+        totalDrafted > 0 ? Double(totalAccepted) / Double(totalDrafted) : 0
+    }
+
+    public var burstCount: Int { totalBursts }
 }

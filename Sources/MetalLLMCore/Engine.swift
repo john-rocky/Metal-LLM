@@ -98,6 +98,11 @@ public actor MetalLLMEngine {
         try await ctx.prefill(tokens: tokens)
         metrics.endPrefill(tokenCount: tokens.count)
 
+        // Feed prompt tokens to n-gram drafter for pattern matching
+        if config.speculative {
+            specDecode.ngramDrafter.feedPromptTokens(tokens)
+        }
+
         // Decode
         metrics.beginDecode()
         var totalGenerated = 0
@@ -105,7 +110,7 @@ public actor MetalLLMEngine {
         while totalGenerated < config.maxTokens && !cancelled {
             if config.speculative && config.temperature == 0,
                let result = try await specDecode.step(ctx: ctx) {
-                // Speculative path succeeded
+                // Speculative burst: multiple tokens emitted
                 metrics.recordDecodedTokens(result.emitted.count)
                 metrics.recordSpecBurst(accepted: result.accepted, total: result.drafted)
                 totalGenerated += result.emitted.count
@@ -121,9 +126,16 @@ public actor MetalLLMEngine {
                     if isFinal { return totalGenerated }
                 }
             } else {
+                // Greedy fallback (single token)
                 let (tokenId, text, isFinal) = try await ctx.sampleDecodeAndEmit()
                 metrics.recordDecodedTokens()
                 totalGenerated += 1
+
+                // Feed to n-gram for future drafts
+                if config.speculative {
+                    specDecode.ngramDrafter.feedTokens([tokenId])
+                }
+
                 let snap = metrics.snapshot()
                 onToken(TokenEvent(
                     token: text, tokenId: tokenId,

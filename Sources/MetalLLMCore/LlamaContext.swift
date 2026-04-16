@@ -283,6 +283,64 @@ public actor LlamaContext {
         llama_sampler_sample(sampling, context, i)
     }
 
+    // MARK: - Speculative verify (single actor hop for entire burst)
+
+    /// Draft K proposals → verify in one batch → greedy accept → KV rollback → decode bonus.
+    /// All done inside one actor hop to minimize overhead.
+    public func speculativeVerify(proposals: [llama_token]) throws -> SpecDecodeResult {
+        // 1. Sample anchor token from current logits
+        let anchor = llama_sampler_sample(sampling, context, -1)
+
+        // 2. Build verify batch: [anchor, proposals[0], ..., proposals[K-1]]
+        let verifyTokens = [anchor] + proposals
+        llama_batch_clear(&batch)
+        for (i, token) in verifyTokens.enumerated() {
+            llama_batch_add(&batch, token, nCur + Int32(i), [0], true)
+        }
+
+        guard llama_decode(context, batch) == 0 else {
+            throw LlamaContextError.decodeFailed("spec verify at pos \(nCur)")
+        }
+
+        // 3. Greedy acceptance: compare verifier argmax against proposals
+        var matched = 0
+        for k in 0..<proposals.count {
+            let vChoice = argmaxAt(Int32(k))
+            if vChoice == proposals[k] {
+                matched += 1
+            } else {
+                break
+            }
+        }
+
+        // 4. Bonus token from verifier at first disagreement
+        let bonusToken = argmaxAt(Int32(matched))
+
+        // 5. Build emitted sequence
+        var emitted: [llama_token] = [anchor]
+        emitted.append(contentsOf: proposals.prefix(matched))
+        emitted.append(bonusToken)
+
+        // 6. Advance position and truncate rejected KV
+        let advanceBy = Int32(matched + 1)  // anchor consumed + matched proposals
+        let newPos = nCur + advanceBy
+        let mem = llama_get_memory(context)
+        // Remove KV entries for rejected positions (after newPos)
+        llama_memory_seq_rm(mem, 0, newPos, -1)
+
+        // 7. Decode bonus token to prepare logits for next step
+        llama_batch_clear(&batch)
+        llama_batch_add(&batch, bonusToken, newPos, [0], true)
+        guard llama_decode(context, batch) == 0 else {
+            throw LlamaContextError.decodeFailed("spec bonus at pos \(newPos)")
+        }
+
+        nCur = newPos + 1
+        nDecode += Int32(emitted.count)
+
+        return SpecDecodeResult(emitted: emitted, accepted: matched, drafted: proposals.count)
+    }
+
     // MARK: - KV cache management
 
     /// Remove KV entries from position p0 to p1 (exclusive). Pass p1 = -1 for "to end".

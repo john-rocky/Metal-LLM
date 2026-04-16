@@ -20,7 +20,8 @@ struct BenchMain {
 
         let modelPath = args[1]
         let maxTokens = args.count > 2 ? Int(args[2]) ?? 128 : 128
-        let prompt = "<start_of_turn>user\nExplain quantum computing in detail, including qubits, superposition, and entanglement.<end_of_turn>\n<start_of_turn>model\n"
+        // Prompt that generates repetitive code patterns (good for n-gram spec)
+        let prompt = "<start_of_turn>user\nWrite a Swift struct called User with properties: id (Int), name (String), email (String), age (Int), isActive (Bool). Then write Codable conformance, a static mock array of 10 users, and a function to filter active users.<end_of_turn>\n<start_of_turn>model\n"
 
         print("=== Metal-LLM Bench ===")
         print("Model: \(modelPath)")
