@@ -21,7 +21,9 @@ targets:
       base:
         INFOPLIST_FILE: Sources/Info.plist
         CODE_SIGN_ENTITLEMENTS: MetalLLMApp.entitlements
-        PRODUCT_BUNDLE_IDENTIFIER: com.example.MetalLLMApp
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: MFN25KNUGJ
+        PRODUCT_BUNDLE_IDENTIFIER: com.majima.MetalLLMApp
         SWIFT_VERSION: "6.0"
         MARKETING_VERSION: "1.0"
         CURRENT_PROJECT_VERSION: "1"
