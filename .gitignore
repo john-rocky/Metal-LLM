@@ -48,3 +48,4 @@ External/llama.cpp/build*/
 output/
 tmp/
 *.log
+__pycache__/
