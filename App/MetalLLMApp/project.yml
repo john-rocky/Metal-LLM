@@ -1,0 +1,36 @@
+name: MetalLLMApp
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "18.0"
+  xcodeVersion: "16.0"
+
+packages:
+  Metal-LLM:
+    path: ../..
+
+targets:
+  MetalLLMApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+        excludes:
+          - Info.plist
+    settings:
+      base:
+        INFOPLIST_FILE: Sources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: MetalLLMApp.entitlements
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.MetalLLMApp
+        SWIFT_VERSION: "6.0"
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: false
+    dependencies:
+      - package: Metal-LLM
+        product: MetalLLMCore
+      - package: Metal-LLM
+        product: MetalLLMUI
+    entitlements:
+      path: MetalLLMApp.entitlements

@@ -80,19 +80,20 @@ public final class ChatViewModel {
             speculative: true
         )
 
-        let stream = await engine.generateStream(prompt: prompt, config: config)
         do {
-            for try await event in stream {
-                if let idx = messages.indices.last {
-                    messages[idx].content += event.token
+            try await engine.generate(prompt: prompt, config: config) { [weak self] event in
+                Task { @MainActor in
+                    guard let self else { return }
+                    if let idx = self.messages.indices.last {
+                        self.messages[idx].content += event.token
+                    }
+                    self.tokensPerSecond = event.tokensPerSecond
+                    self.tokensGenerated += 1
                 }
-                tokensPerSecond = event.tokensPerSecond
-                tokensGenerated += 1
-
-                let snap = await engine.metricsSnapshot()
-                acceptanceRate = snap.acceptanceRate
-                updateThermalDisplay(snap.thermalState)
             }
+            let snap = await engine.metricsSnapshot()
+            acceptanceRate = snap.acceptanceRate
+            updateThermalDisplay(snap.thermalState)
         } catch {
             if let idx = messages.indices.last {
                 messages[idx].content += "\n[Error: \(error.localizedDescription)]"
