@@ -400,10 +400,10 @@ If upstream accepts (1) but not (2), we keep (2) as our patch. If upstream accep
 
 ## 6. Week-5 onboarding: step-by-step
 
-Working tree: `/Users/majimadaisuke/Downloads/Metal-LLM/`. Starting from the pinned SHA `b3d7587`.
+Working tree: `~/Downloads/Metal-LLM/`. Starting from the pinned SHA `b3d7587`.
 
 ### Day 1 (morning, ~3h) — Fork + ABI scaffold
-1. `cd /Users/majimadaisuke/Downloads/Metal-LLM && git submodule add https://github.com/ggml-org/llama.cpp External/llama.cpp`.
+1. `cd ~/Downloads/Metal-LLM && git submodule add https://github.com/ggml-org/llama.cpp External/llama.cpp`.
 2. `cd External/llama.cpp && git checkout -b mlllm/main b3d7587`.
 3. Open `include/llama.h`, append the §3 block at ~line 905 under a new `// Metal-LLM fork — speculative C ABI` comment.
 4. Create `src/llama-speculative.cpp` and `src/llama-speculative-internal.h` with the skeleton from §4.2/4.3. Leave the C++-internal factories as `TODO` stubs that return `nullptr` for the internal `type` enum values — **Week 5 ships only `LLAMA_SPEC_TYPE_EXTERNAL`**.

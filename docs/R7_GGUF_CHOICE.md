@@ -158,7 +158,7 @@ without the entitlement but with `extended-virtual-addressing`.
 python3 -m pip install --user 'huggingface_hub[cli]>=0.24'
 
 # Create model dir inside the Metal-LLM project
-cd /Users/majimadaisuke/Downloads/Metal-LLM
+cd ~/Downloads/Metal-LLM
 mkdir -p Models
 
 # Primary: Unsloth's Q4_K_M (has full quant range; our chosen default)
